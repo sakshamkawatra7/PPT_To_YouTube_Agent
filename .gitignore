@@ -1,0 +1,9 @@
+.venv/
+credentials.json
+token.json
+input_ppt/*
+!input_ppt/.gitkeep
+work/
+output_videos/
+logs/
+__pycache__/

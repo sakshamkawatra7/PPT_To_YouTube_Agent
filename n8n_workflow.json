@@ -1,0 +1,65 @@
+{
+  "name": "PPT to YouTube - Local Windows Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "a3f63b9a-95b4-4d89-9f7a-14bca4f9b201",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8000/process-next",
+        "sendBody": false,
+        "options": {
+          "timeout": 3600000
+        }
+      },
+      "id": "4b83c3e1-13ea-40c4-b5e5-1c4bde54e702",
+      "name": "Process waiting PowerPoints",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": {
+      "main": [
+        [
+          {
+            "node": "Process waiting PowerPoints",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "8cce2e87-ff6a-46f1-9c42-fd5b6d25f101",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

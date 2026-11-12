@@ -1,0 +1,24 @@
+{
+  "input_dir": "input_ppt",
+  "work_dir": "work",
+  "output_dir": "output_videos",
+  "voice": "en-IN-NeerjaNeural",
+  "rate": "+0%",
+  "volume": "+0%",
+  "video_width": 1920,
+  "video_height": 1080,
+  "fps": 25,
+  "youtube_privacy": "public",
+  "youtube_category_id": "27",
+  "youtube_language": "en",
+  "youtube_tags": [
+    "education",
+    "technology",
+    "learning"
+  ],
+  "channel_description_suffix": "Created from a PowerPoint presentation with generated English narration.",
+  "made_for_kids": false,
+  "contains_synthetic_media": false,
+  "delete_input_after_success": false,
+  "max_script_chars_per_slide": 5000
+}
