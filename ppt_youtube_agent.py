@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse, json, logging, re, shutil, subprocess, sys, time, zipfile
 from pathlib import Path
+import os
 from xml.etree import ElementTree as ET
 
 import fitz
@@ -107,16 +108,31 @@ def extract_slide_scripts(pptx_path: Path, cfg: dict) -> list[str]:
         scripts.append(script)
     return scripts
 
+
 def find_soffice() -> str:
     candidates = [
         shutil.which("soffice"),
-        r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-        r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+
+        # macOS
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+
+        # Windows
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+
+        # Linux
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
     ]
-    for c in candidates:
-        if c and Path(c).exists():
-            return str(c)
-    raise FileNotFoundError("LibreOffice not found. Install it and/or add its program folder to PATH.")
+
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "LibreOffice not found. Install LibreOffice and ensure "
+        "its program folder is available in PATH."
+    )
 
 def find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
@@ -155,14 +171,38 @@ async def make_tts(text: str, out_file: Path, cfg: dict):
     )
     await communicate.save(str(out_file))
 
+
 def probe_duration(ffmpeg: str, audio_path: Path) -> float:
-    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe"))
-    if not Path(ffprobe).exists():
-        ffprobe = shutil.which("ffprobe") or "ffprobe"
+    ffmpeg_path = Path(ffmpeg)
+
+    # Look for ffprobe alongside ffmpeg first.
+    ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    ffprobe_candidate = ffmpeg_path.with_name(ffprobe_name)
+
+    if ffprobe_candidate.exists():
+        ffprobe = str(ffprobe_candidate)
+    else:
+        # Fall back to searching the system PATH.
+        ffprobe = shutil.which("ffprobe")
+
+    if not ffprobe:
+        raise FileNotFoundError(
+            "FFprobe not found. Install FFmpeg and ensure FFprobe is available in PATH."
+        )
+
     result = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
-        check=True, capture_output=True, text=True
+        [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
+
     return max(0.5, float(result.stdout.strip()))
 
 def srt_time(seconds: float) -> str:

@@ -1,4 +1,4 @@
-.venv/
+.ytagent/
 credentials.json
 token.json
 input_ppt/*
@@ -7,3 +7,4 @@ work/
 output_videos/
 logs/
 __pycache__/
+.DS_Store
