@@ -20,5 +20,6 @@
   "made_for_kids": false,
   "contains_synthetic_media": false,
   "delete_input_after_success": false,
-  "max_script_chars_per_slide": 5000
+  "max_script_chars_per_slide": 5000,
+  "max_workers": 4
 }

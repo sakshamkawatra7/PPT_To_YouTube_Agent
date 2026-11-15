@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 from xml.etree import ElementTree as ET
 
-import fitz
+import pymupdf
 import edge_tts
 import asyncio
 from pptx import Presentation
@@ -13,6 +13,8 @@ from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
@@ -140,27 +142,69 @@ def find_ffmpeg() -> str:
         raise FileNotFoundError("FFmpeg not found. Install FFmpeg and add its bin folder to PATH.")
     return exe
 
+
 def render_slides(pptx_path: Path, work: Path) -> list[Path]:
     pdf_dir = work / "pdf"
     img_dir = work / "slides"
+    profile_dir = work / "libreoffice_profile"
+
     pdf_dir.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
     soffice = find_soffice()
-    cmd = [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(pdf_dir), str(pptx_path)]
-    logging.info("Rendering PowerPoint to PDF...")
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+    # Give every presentation its own LibreOffice user profile.
+    profile_uri = profile_dir.resolve().as_uri()
+
+    cmd = [
+        soffice,
+        "--headless",
+        f"-env:UserInstallation={profile_uri}",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(pdf_dir),
+        str(pptx_path),
+    ]
+
+    logging.info("Rendering PowerPoint to PDF: %s", pptx_path.name)
+
+    subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
     pdf_path = pdf_dir / (pptx_path.stem + ".pdf")
+
     if not pdf_path.exists():
-        raise RuntimeError("LibreOffice did not create the expected PDF. Check whether the PPTX opens correctly.")
-    doc = fitz.open(pdf_path)
+        raise RuntimeError(
+            "LibreOffice did not create the expected PDF. "
+            "Check whether the PPTX opens correctly."
+        )
+
+    doc = pymupdf.open(pdf_path)
+
     images = []
-    for i, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8), alpha=False)
-        out = img_dir / f"slide_{i+1:03d}.jpg"
-        pix.save(out, jpg_quality=90)
-        images.append(out)
-    doc.close()
+
+    try:
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(1.8, 1.8),
+                alpha=False,
+            )
+
+            out = img_dir / f"slide_{i+1:03d}.jpg"
+            pix.save(out, jpg_quality=90)
+            images.append(out)
+
+    finally:
+        doc.close()
+
     return images
+
 
 async def make_tts(text: str, out_file: Path, cfg: dict):
     voice = cfg.get("voice", "en-IN-NeerjaNeural")
@@ -319,20 +363,27 @@ def process_pptx(pptx_path: Path, cfg: dict, upload: bool = True):
     pptx_path = pptx_path.resolve()
     if not pptx_path.exists() or pptx_path.suffix.lower() != ".pptx":
         raise FileNotFoundError(f"Expected an existing .pptx file: {pptx_path}")
-    work = Path(cfg["work_dir"]) / f"{pptx_path.stem}_{int(time.time())}"
+    work = (
+        Path(cfg["work_dir"])
+        / f"{pptx_path.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    )
     work.mkdir(parents=True, exist_ok=True)
     scripts = extract_slide_scripts(pptx_path, cfg)
     (work / "scripts.json").write_text(json.dumps(scripts, ensure_ascii=False, indent=2), encoding="utf-8")
     images = render_slides(pptx_path, work)
     if len(images) != len(scripts):
         raise RuntimeError(f"Slide/image count mismatch: {len(scripts)} scripts vs {len(images)} rendered slides.")
-    out = Path(cfg["output_dir"]) / f"{pptx_path.stem}.mp4"
+    presentation_output_dir = Path(cfg["output_dir"]) / pptx_path.stem
+    presentation_output_dir.mkdir(parents=True, exist_ok=True)
+
+    out = presentation_output_dir / f"{pptx_path.stem}.mp4"
     build_video(pptx_path, scripts, images, work, out, cfg)
     logging.info("Video created: %s", out)
     if upload:
         video_id = upload_to_youtube(out, cfg)
-        (Path(cfg["output_dir"]) / f"{pptx_path.stem}_youtube_url.txt").write_text(
-            f"https://www.youtube.com/watch?v={video_id}\n", encoding="utf-8"
+        (out.parent / f"{pptx_path.stem}_youtube_url.txt").write_text(
+            f"https://www.youtube.com/watch?v={video_id}\n",
+            encoding="utf-8",
         )
         return {"video": str(out), "youtube_url": f"https://www.youtube.com/watch?v={video_id}"}
     return {"video": str(out), "youtube_url": None}
@@ -347,37 +398,114 @@ def authenticate():
         logging.info("Authenticated YouTube channel: %s (%s)", item["snippet"]["title"], item["id"])
     logging.info("OAuth token saved. You can now upload automatically.")
 
-def process_next():
+def process_next(upload=True, max_workers=2):
     cfg = load_config()
     setup_logging()
+
     input_dir = Path(cfg["input_dir"])
     input_dir.mkdir(parents=True, exist_ok=True)
-    candidates = sorted(p for p in input_dir.glob("*.pptx") if not p.name.startswith("~$"))
+
+    candidates = sorted(
+        p for p in input_dir.glob("*.pptx")
+        if not p.name.startswith("~$")
+    )
+
     if not candidates:
         logging.info("No .pptx files waiting in input_ppt.")
-        return {"status": "idle", "message": "No PowerPoint file found."}
+        return {
+            "status": "idle",
+            "message": "No PowerPoint files found."
+        }
+
+    max_workers = max(1, int(max_workers))
+
+    logging.info(
+        "Starting batch processing: %s presentations, %s workers.",
+        len(candidates),
+        max_workers,
+    )
+
     results = []
-    for pptx in candidates:
-        try:
-            logging.info("Starting: %s", pptx.name)
-            result = process_pptx(pptx, cfg, upload=True)
-            results.append({"file": pptx.name, **result})
-            if cfg.get("delete_input_after_success", False):
-                pptx.unlink(missing_ok=True)
-            else:
-                done_dir = input_dir / "processed"
-                done_dir.mkdir(exist_ok=True)
-                shutil.move(str(pptx), str(done_dir / pptx.name))
-        except Exception:
-            logging.exception("Failed processing %s", pptx.name)
-            failed_dir = input_dir / "failed"
-            failed_dir.mkdir(exist_ok=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        future_to_file = {
+            executor.submit(process_pptx, pptx, cfg, upload): pptx
+            for pptx in candidates
+        }
+
+        for future in as_completed(future_to_file):
+            pptx = future_to_file[future]
+
             try:
-                shutil.move(str(pptx), str(failed_dir / pptx.name))
-            except Exception:
-                pass
-            raise
-    return {"status": "completed", "results": results}
+                result = future.result()
+
+                logging.info("Successfully processed: %s", pptx.name)
+
+                results.append({
+                    "file": pptx.name,
+                    "status": "success",
+                    **result,
+                })
+
+                if cfg.get("delete_input_after_success", False):
+                    pptx.unlink(missing_ok=True)
+                else:
+                    done_dir = input_dir / "processed"
+                    done_dir.mkdir(exist_ok=True)
+                    shutil.move(
+                        str(pptx),
+                        str(done_dir / pptx.name),
+                    )
+
+            except Exception as exc:
+                logging.error(
+                    "Failed processing %s: %s",
+                    pptx.name,
+                    exc,
+                )
+
+                failed_dir = input_dir / "failed"
+                failed_dir.mkdir(exist_ok=True)
+
+                try:
+                    shutil.move(
+                        str(pptx),
+                        str(failed_dir / pptx.name),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Could not move failed file: %s",
+                        pptx.name,
+                    )
+
+                results.append({
+                    "file": pptx.name,
+                    "status": "failed",
+                    "error": str(exc),
+                })
+
+    successful = sum(
+        1 for item in results if item["status"] == "success"
+    )
+    failed = sum(
+        1 for item in results if item["status"] == "failed"
+    )
+
+    logging.info(
+        "Batch completed. Successful: %s, Failed: %s",
+        successful,
+        failed,
+    )
+
+    return {
+        "status": "completed",
+        "total": len(candidates),
+        "successful": successful,
+        "failed": failed,
+        "results": results,
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(description="PowerPoint to narrated YouTube video agent")
@@ -394,7 +522,14 @@ def main():
         result = process_pptx(Path(args.input), cfg, upload=not args.no_upload)
         print(json.dumps(result, indent=2))
     elif args.process_next:
-        print(json.dumps(process_next(), indent=2))
+        max_workers = int(cfg.get("max_workers", 2))
+
+        result = process_next(
+            upload=not args.no_upload,
+            max_workers=max_workers,
+        )
+
+        print(json.dumps(result, indent=2))
     else:
         parser.print_help()
 
