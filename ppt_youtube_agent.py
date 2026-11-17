@@ -8,6 +8,7 @@ import pymupdf
 import edge_tts
 import asyncio
 from pptx import Presentation
+from pptx.exc import PackageNotFoundError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -359,10 +360,47 @@ def upload_to_youtube(video_path: Path, cfg: dict, title: str | None = None):
     logging.info("Uploaded: https://www.youtube.com/watch?v=%s", video_id)
     return video_id
 
+def validate_pptx(pptx_path: Path) -> None:
+    """
+    Validate that the supplied file is a readable PowerPoint presentation.
+    Raises ValueError with a user-friendly message if invalid.
+    """
+
+    if not pptx_path.exists():
+        raise FileNotFoundError(
+            f"PowerPoint file does not exist: {pptx_path}"
+        )
+
+    if not pptx_path.is_file():
+        raise ValueError(
+            f"Expected a file, but received: {pptx_path}"
+        )
+
+    if pptx_path.suffix.lower() != ".pptx":
+        raise ValueError(
+            f"Unsupported file format: {pptx_path.name}. "
+            "Only .pptx files are supported."
+        )
+
+    if pptx_path.stat().st_size == 0:
+        raise ValueError(
+            f"{pptx_path.name} is empty."
+        )
+
+    try:
+        Presentation(str(pptx_path))
+
+    except Exception as exc:
+        raise ValueError(
+            f"{pptx_path.name} is not a valid or readable "
+            "PowerPoint presentation. The file may be corrupted."
+        ) from exc
+
 def process_pptx(pptx_path: Path, cfg: dict, upload: bool = True):
     pptx_path = pptx_path.resolve()
-    if not pptx_path.exists() or pptx_path.suffix.lower() != ".pptx":
-        raise FileNotFoundError(f"Expected an existing .pptx file: {pptx_path}")
+    
+    validate_pptx(pptx_path)
+
     work = (
         Path(cfg["work_dir"])
         / f"{pptx_path.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
