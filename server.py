@@ -18,8 +18,8 @@ def run_queue():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-@app.post("/upload-and-publish")
-async def upload_and_publish(file: UploadFile = File(...)):
+@app.post("/upload-and-process")
+def upload_and_publish(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pptx"):
         raise HTTPException(status_code=400, detail="Upload a .pptx PowerPoint file.")
     input_dir = Path(cfg["input_dir"])
@@ -29,11 +29,11 @@ async def upload_and_publish(file: UploadFile = File(...)):
     with destination.open("wb") as out:
         shutil.copyfileobj(file.file, out)
     try:
-        result = process_pptx(destination, cfg, upload=True)
+        result = process_pptx(destination, cfg)
         processed = input_dir / "processed"
         processed.mkdir(exist_ok=True)
         shutil.move(str(destination), str(processed / destination.name))
-        return {"status": "published", "result": result}
+        return {"status": "processed", "result": result}
     except Exception as exc:
         failed = input_dir / "failed"
         failed.mkdir(exist_ok=True)

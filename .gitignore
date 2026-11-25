@@ -8,3 +8,4 @@ output_videos/
 logs/
 __pycache__/
 .DS_Store
+jobs.db
