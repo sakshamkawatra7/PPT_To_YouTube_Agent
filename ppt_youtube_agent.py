@@ -17,6 +17,8 @@ from google.oauth2.credentials import Credentials
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 
+import job_registry
+
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -285,7 +287,8 @@ def build_video(pptx_path: Path, scripts: list[str], slide_images: list[Path], w
             "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p",
             "-shortest", str(segment)
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # subprocess.run(cmd, check=True, capture_output=True, text=True)
+        raise RuntimeError("TEST: Retry mechanism failure simulation")
         segment_paths.append(segment)
 
     concat_file = work / "concat.txt"
@@ -396,9 +399,10 @@ def validate_pptx(pptx_path: Path) -> None:
             "PowerPoint presentation. The file may be corrupted."
         ) from exc
 
-def process_pptx(pptx_path: Path, cfg: dict, upload: bool = True):
+
+def process_pptx(pptx_path: Path, cfg: dict):
     pptx_path = pptx_path.resolve()
-    
+
     validate_pptx(pptx_path)
 
     work = (
@@ -406,25 +410,52 @@ def process_pptx(pptx_path: Path, cfg: dict, upload: bool = True):
         / f"{pptx_path.stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     )
     work.mkdir(parents=True, exist_ok=True)
+
     scripts = extract_slide_scripts(pptx_path, cfg)
-    (work / "scripts.json").write_text(json.dumps(scripts, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (work / "scripts.json").write_text(
+        json.dumps(scripts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     images = render_slides(pptx_path, work)
+
     if len(images) != len(scripts):
-        raise RuntimeError(f"Slide/image count mismatch: {len(scripts)} scripts vs {len(images)} rendered slides.")
+        raise RuntimeError(
+            f"Slide/image count mismatch: {len(scripts)} scripts "
+            f"vs {len(images)} rendered slides."
+        )
+
+    
+    # Generate the video and supporting files in the temporary work directory first.
+    temp_out = work / f"{pptx_path.stem}.mp4"
+
+    build_video(pptx_path, scripts, images, work, temp_out, cfg)
+
+    # Only create the final output folder after video generation succeeds.
     presentation_output_dir = Path(cfg["output_dir"]) / pptx_path.stem
     presentation_output_dir.mkdir(parents=True, exist_ok=True)
 
     out = presentation_output_dir / f"{pptx_path.stem}.mp4"
-    build_video(pptx_path, scripts, images, work, out, cfg)
+
+    # Move the completed video and its supporting files to the final folder.
+    shutil.move(str(temp_out), str(out))
+    shutil.move(
+        str(temp_out.with_suffix(".srt")),
+        str(out.with_suffix(".srt"))
+    )
+
+    temp_thumbnail = temp_out.with_name(temp_out.stem + "_thumbnail.jpg")
+    final_thumbnail = out.with_name(out.stem + "_thumbnail.jpg")
+
+    shutil.move(str(temp_thumbnail), str(final_thumbnail))
+
     logging.info("Video created: %s", out)
-    if upload:
-        video_id = upload_to_youtube(out, cfg)
-        (out.parent / f"{pptx_path.stem}_youtube_url.txt").write_text(
-            f"https://www.youtube.com/watch?v={video_id}\n",
-            encoding="utf-8",
-        )
-        return {"video": str(out), "youtube_url": f"https://www.youtube.com/watch?v={video_id}"}
-    return {"video": str(out), "youtube_url": None}
+
+    return {
+        "video": str(out),
+        "youtube_url": None,
+    }
 
 def authenticate():
     svc = youtube_service()
@@ -436,9 +467,11 @@ def authenticate():
         logging.info("Authenticated YouTube channel: %s (%s)", item["snippet"]["title"], item["id"])
     logging.info("OAuth token saved. You can now upload automatically.")
 
-def process_next(upload=True, max_workers=2):
+def process_next(upload=False, max_workers=2):
     cfg = load_config()
     setup_logging()
+
+    job_registry.initialize_database()
 
     input_dir = Path(cfg["input_dir"])
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -462,21 +495,76 @@ def process_next(upload=True, max_workers=2):
         len(candidates),
         max_workers,
     )
-
+    
+    jobs_to_process = []
     results = []
+    videos_to_upload = []
+
+    for pptx in candidates:
+        file_hash = job_registry.calculate_file_hash(pptx)
+
+        is_new, job_info = job_registry.register_job(
+            filename=pptx.name,
+            file_hash=file_hash,
+            stored_path=pptx,
+        )
+
+        if is_new:
+            jobs_to_process.append({
+                "pptx": pptx,
+                "job_id": job_info,
+            })
+
+            logging.info(
+                "Registered new job %s for %s",
+                job_info,
+                pptx.name,
+            )
+
+        else:
+            logging.warning(
+                "Duplicate detected: %s. Existing job: %s",
+                pptx.name,
+                job_info["job_id"],
+            )
+
+            duplicates_dir = input_dir / "duplicates"
+
+            duplicate_path = job_registry.move_job_file(
+                pptx,
+                duplicates_dir,
+                uuid.uuid4().hex,
+            )
+
+            logging.info(
+                "Moved duplicate file to: %s",
+                duplicate_path,
+            )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
         future_to_file = {
-            executor.submit(process_pptx, pptx, cfg, upload): pptx
-            for pptx in candidates
+            executor.submit(
+                process_pptx,
+                job["pptx"],
+                cfg,
+            ): job
+            for job in jobs_to_process
         }
 
         for future in as_completed(future_to_file):
-            pptx = future_to_file[future]
+            job = future_to_file[future]
+            pptx = job["pptx"]
+            job_id = job["job_id"]
 
             try:
                 result = future.result()
+
+                job_registry.update_job_status(
+                    job_id,
+                    "success",
+                    output_path=Path(result["video"]),
+                )
 
                 logging.info("Successfully processed: %s", pptx.name)
 
@@ -488,15 +576,41 @@ def process_next(upload=True, max_workers=2):
 
                 if cfg.get("delete_input_after_success", False):
                     pptx.unlink(missing_ok=True)
+
+                    job_registry.update_job_stored_path(
+                        job_id,
+                        None,
+                    )
                 else:
                     done_dir = input_dir / "processed"
-                    done_dir.mkdir(exist_ok=True)
-                    shutil.move(
-                        str(pptx),
-                        str(done_dir / pptx.name),
+
+                    stored_path = job_registry.move_job_file(
+                        pptx,
+                        done_dir,
+                        job_id,
                     )
 
+                    job_registry.update_job_stored_path(
+                        job_id,
+                        stored_path,
+                    )
+                if upload:
+                    job_registry.update_upload_status(
+                        job_id,
+                        "pending",
+                    )
+                    videos_to_upload.append({
+                        "file": pptx.name,
+                        "video": Path(result["video"]),
+                        "job_id": job_id,
+                    })               
+
             except Exception as exc:
+                job_registry.update_job_status(
+                    job_id,
+                    "failed",
+                )
+                
                 logging.error(
                     "Failed processing %s: %s",
                     pptx.name,
@@ -504,13 +618,19 @@ def process_next(upload=True, max_workers=2):
                 )
 
                 failed_dir = input_dir / "failed"
-                failed_dir.mkdir(exist_ok=True)
 
                 try:
-                    shutil.move(
-                        str(pptx),
-                        str(failed_dir / pptx.name),
+                    stored_path = job_registry.move_job_file(
+                        pptx,
+                        failed_dir,
+                        job_id,
                     )
+
+                    job_registry.update_job_stored_path(
+                        job_id,
+                        stored_path,
+                    )
+
                 except Exception:
                     logging.exception(
                         "Could not move failed file: %s",
@@ -522,6 +642,90 @@ def process_next(upload=True, max_workers=2):
                     "status": "failed",
                     "error": str(exc),
                 })
+    
+    
+    if upload:
+        for item in videos_to_upload:
+            try:
+                logging.info(
+                    "Uploading to YouTube: %s",
+                    item["file"],
+                )
+
+                job_registry.update_upload_status(
+                    item["job_id"],
+                    "uploading",
+                )
+
+                video_id = upload_to_youtube(item["video"], cfg)
+
+            except Exception as exc:
+                try:
+                    job_registry.update_upload_status(
+                        item["job_id"],
+                        "failed",
+                    )
+                except Exception:
+                    logging.exception(
+                        "Could not update upload status for %s",
+                        item["file"],
+                    )
+
+                logging.exception(
+                    "YouTube upload failed for %s: %s",
+                    item["file"],
+                    exc,
+                )
+
+                for result in results:
+                    if result["file"] == item["file"]:
+                        result["upload_error"] = str(exc)
+                        break
+
+                continue
+
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+
+            # The YouTube upload has succeeded.
+            try:
+                job_registry.update_upload_status(
+                    item["job_id"],
+                    "success",
+                )
+            except Exception:
+                logging.exception(
+                    "Video uploaded, but database status update failed: %s",
+                    item["file"],
+                )
+
+            # Record the URL in the processing result.
+            for result in results:
+                if result["file"] == item["file"]:
+                    result["youtube_url"] = youtube_url
+                    break
+
+            # Save the URL locally as a separate operation.
+            url_file = (
+                item["video"].parent
+                / f"{item['video'].stem}_youtube_url.txt"
+            )
+
+            try:
+                url_file.write_text(
+                    f"{youtube_url}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                logging.exception(
+                    "Video uploaded successfully, but URL file could not be saved: %s",
+                    url_file,
+                )
+
+            logging.info(
+                "Successfully uploaded %s: %s",
+                item["file"],
+                youtube_url,
+            )
 
     successful = sum(
         1 for item in results if item["status"] == "success"
@@ -548,7 +752,19 @@ def process_next(upload=True, max_workers=2):
 def main():
     parser = argparse.ArgumentParser(description="PowerPoint to narrated YouTube video agent")
     parser.add_argument("--input", help="Process one .pptx file")
-    parser.add_argument("--no-upload", action="store_true", help="Render MP4 but do not upload")
+    upload_group = parser.add_mutually_exclusive_group()
+
+    upload_group.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload generated videos to YouTube",
+    )
+
+    upload_group.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Do not upload videos (default)",
+    )
     parser.add_argument("--auth", action="store_true", help="Authenticate the YouTube channel")
     parser.add_argument("--process-next", action="store_true", help="Process all .pptx files in input_ppt")
     args = parser.parse_args()
@@ -557,13 +773,13 @@ def main():
     if args.auth:
         authenticate()
     elif args.input:
-        result = process_pptx(Path(args.input), cfg, upload=not args.no_upload)
+        result = process_pptx(Path(args.input), cfg)
         print(json.dumps(result, indent=2))
     elif args.process_next:
         max_workers = int(cfg.get("max_workers", 2))
 
         result = process_next(
-            upload=not args.no_upload,
+            upload=args.upload,
             max_workers=max_workers,
         )
 
