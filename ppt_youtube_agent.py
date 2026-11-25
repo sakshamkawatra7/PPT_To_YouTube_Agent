@@ -287,8 +287,8 @@ def build_video(pptx_path: Path, scripts: list[str], slide_images: list[Path], w
             "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p",
             "-shortest", str(segment)
         ]
-        # subprocess.run(cmd, check=True, capture_output=True, text=True)
-        raise RuntimeError("TEST: Retry mechanism failure simulation")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # raise RuntimeError("TEST: Simulated video generation failure")
         segment_paths.append(segment)
 
     concat_file = work / "concat.txt"
